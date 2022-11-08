@@ -32,7 +32,7 @@ def main():
 		elif rebirth:
 			exe = "../dxx-rebirth/build/d1x-rebirth/d1x-rebirth"
 		else:
-			exe = "../DXX-Retro-ar/d1/d1x-rebirth"
+			exe = "../DXX-Retro-ar/lind1/d1x-rebirth"
 		retro = not rebirth and not chocolate
 
 	d1x = retro or rebirth
@@ -107,18 +107,23 @@ def main():
 	vals = {'obj_size':obj_size, 'obj_pl_sec_ammo':obj_pl_sec_ammo,
 		'obj_pl_sec_wpn':obj_pl_sec_wpn,
 		'obj_pos':obj_pos, 'obj_id':obj_id, 'obj_track_goal':obj_track_goal,
-		'obj_phys_flags':obj_phys_flags, 'rebirth':rebirth, 'd1x':d1x,
+		'obj_phys_flags':obj_phys_flags,
+		'rebirth':rebirth, 'd1x':d1x, 'retro':retro,
 		'sh_rob_info':sh_rob_info}
 	#print(repr(vals))
 
 	session = frida.attach(pid)
 	script = session.create_script("""
 	var addrs = %s, vals = %s;
+	var ptrs = {}
+	for (var x in addrs)
+		ptrs[x] = ptr(addrs[x]);
 	//console.log(JSON.stringify(addrs));
 	if (0)
-	Interceptor.attach(ptr(addrs.calc_frame_time), {
-		onEnter(args) {
-			send('calc_frame_time ' + 65536 / ptr(addrs.FrameTime).readInt());
+	Interceptor.attach(ptrs.calc_frame_time, {
+		onLeave(ret) {
+			//send('calc_frame_time ' + 65536 / ptr(addrs.FrameTime).readInt());
+			send('FrameTime ' + ptrs.FrameTime.readInt());
 		}
 	});
 	function readVec(p) {
@@ -128,23 +133,42 @@ def main():
 		var dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
 		return Math.sqrt(dx * dx + dy * dy + dz * dz);
 	}
+	function dot(a, b) {
+		return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+	}
+	function calcdir(a, b) {
+		var dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2];
+		var mag = Math.sqrt(dx * dx + dy * dy + dz * dz);
+		return [dx / mag, dy / mag, dz / mag];
+	}
 	var the_missile;
-	var last_pos, last_time;
+	var last_pos, last_time, last_dir;
 	Interceptor.attach(ptr(addrs.Laser_do_weapon_sequence), {
 		onEnter(args) {
 			var time = (vals.d1x ? ptr(addrs.GameTime64).readU64() : ptr(addrs.GameTime).readU32()) / 65536;
 			var obj = vals.rebirth ? args[1] : args[0];
 			the_missile = obj.sub(ptr(addrs.ConsoleObject).readPointer()) / vals.obj_size;
 			var pos = readVec(obj.add(vals.obj_pos))
-			var vel;
-			if (last_pos)
+			var vel = 0, dir = null, ang = 0;
+			if (last_pos) {
 				vel = dist(last_pos, pos) / (time - last_time);
-			last_pos = pos
-			last_time = time
-			send(time.toFixed(5) +
-				' Laser_do_weapon_sequence ' + the_missile + ' ' +
-				pos.map(x => x.toFixed(5)) + ' ' + vel);
+				dir = calcdir(last_pos, pos);
+				if (last_dir) {
+					var x = Math.max(-1, Math.min(1, dot(last_dir, dir)));
+					ang = Math.acos(x) * 180 / Math.PI; // / (time - last_time);
+				}
+			}
+			last_dir = dir;
+			last_pos = pos;
+			last_time = time;
+			send([time].concat(pos).concat([vel, ang]).map(x => x.toFixed(5)).join(','));
+			/*
+			time.toFixed(5) + ',' +
+				//' Laser_do_weapon_sequence ' + the_missile + ' ' +
+				pos.map(x => x.toFixed(5)) + ',' + vel + ',' + ang) //+ ',' +
+				//(ptrs.doHomerFrame ? ptrs.doHomerFrame.readInt() : 0));
 				//obj.add(vals.obj_track_goal).readU16());
+			*/
 		}
 	});
 	if (0)
@@ -161,20 +185,58 @@ def main():
 			//send('deleted ' + obj);
 		}
 	});
-	if(vals.d1x)
-		Interceptor.replace(ptr(addrs.timer_update), new NativeCallback(() => {
-			var F64_RunTime = ptr(addrs.F64_RunTime);
-			F64_RunTime.writeU64(F64_RunTime.readU64() + 65536 / 200);
-			return F64_RunTime.readU64();
-		}, 'uint64', []));
+	var fixed_fps = 30;
+	var fixed_frametime = Math.floor(65536 / fixed_fps);
+	var time = 0;
+	if(vals.d1x) {
+		Interceptor.replace(ptrs.timer_update, new NativeCallback(() => {
+			var F64_RunTime = ptrs.F64_RunTime;
+			F64_RunTime.writeS64(time); //F64_RunTime.readS64() + 65536 / 200);
+			return time;
+		}, 'int64', []));
+		// called on first frame
+		Interceptor.attach(ptrs.timer_delay_ms || ptrs.timer_delay, {
+			onLeave(retval) {
+				time += fixed_frametime;
+			}
+		});
+	} else {
+		Interceptor.replace(ptrs.timer_get_fixed_seconds, new NativeCallback(() => {
+			return time;
+		}, 'int', []));
+	}
+	Interceptor.attach(ptrs.game_render_frame, {
+		onLeave(retval) {
+			time += fixed_frametime;
+		}
+	});
 	Interceptor.replace(ptr(addrs.do_briefing_screens), new NativeCallback(() => {
 	}, 'void', ['pointer', 'int']));
 	Interceptor.replace(ptr(addrs.RegisterPlayer), new NativeCallback(() => {
 		return 1;
 	}, 'int', []));
-	if (addrs.gr_palette_fade_out)
-		Interceptor.replace(ptr(addrs.gr_palette_fade_out), new NativeCallback(() => {
+	if (ptrs.gr_palette_fade_out)
+		Interceptor.replace(ptrs.gr_palette_fade_out, new NativeCallback(() => {
 		}, 'void', ['pointer', 'int', 'int']));
+	if (ptrs.I_Delay) {
+		Interceptor.replace(ptrs.I_Delay, new NativeCallback(() => {
+			time += fixed_frametime;
+		}, 'void', ['int']));
+		Interceptor.replace(ptrs.I_DelayUS, new NativeCallback(() => {
+			//time += fixed_frametime;
+		}, 'void', ['uint64']));
+		Interceptor.replace(ptrs.I_GetMS, new NativeCallback(() => {
+			return time * 1000 / 65536;
+		}, 'uint32', []));
+		Interceptor.replace(ptrs.I_GetUS, new NativeCallback(() => {
+			return time * 1e6 / 65536;
+		}, 'uint64', []));
+		Interceptor.replace(ptrs.I_GetTicks, new NativeCallback(() => {
+			return Math.floor(time * 1000 / 65536) * 18 / 1000;
+		}, 'uint32', []));
+		Interceptor.replace(ptrs.I_MarkEnd, new NativeCallback(() => {
+		}, 'void', ['uint64']));
+	}
 	var menu_seen;
 	Interceptor.replace(ptr(addrs.DoMenu), new NativeCallback(() => {
 		if (menu_seen && !vals.d1x) {
@@ -227,6 +289,10 @@ def main():
 		//Memory.protect(pl_phys_flags, 2, '---');
 		var Game_suspended = ptr(addrs.Game_suspended);
 		Game_suspended.writeInt(Game_suspended.readInt() | 1); // suspend robots
+		if (vals.retro)
+			new NativeFunction(ptrs.set_homing_update_rate, 'void', ['int'])(30);
+		if (ptrs.FPSLimit)
+			ptrs.FPSLimit.writeInt(999); // disable to use our own fps
 		return 0; //2; // close
 	}, 'int', []));
 	""" % (json.dumps({**to_addrs(['DoMenu', 'do_new_game_menu',
@@ -234,15 +300,20 @@ def main():
 		'do_briefing_screens', 'RegisterPlayer',
 		'load_mission_by_name', 'StartNewLevelSub', 'StartNewGame',
 		'calc_frame_time', 'obj_create', 'Laser_do_weapon_sequence', 
-		'obj_delete'] +
-		(['gr_palette_fade_out'] if not d1x else []) +
+		'obj_delete', 'game_render_frame'] +
+		(['gr_palette_fade_out', 'timer_get_fixed_seconds'] if not d1x else []) +
+		(['I_Delay', 'I_DelayUS', 'I_GetMS', 'I_GetUS', 'I_GetTicks', 'I_MarkEnd'] if chocolate else []) +
 		(['net_missile_firing'] if not rebirth else []) +
-		(['timer_update'] if d1x else [])),
+		(['set_homing_update_rate'] if retro else []) +
+		(['timer_delay_ms'] if rebirth else []) +
+		(['timer_update', 'timer_delay'] if d1x else [])),
 		**v_to_addrs(['FrameTime', 'Objects', 'Game_suspended', 
 			'ConsoleObject'] +
 			(['d_tick_count', 'F64_RunTime', 'GameTime64'] if d1x else ['GameTime']) +
 			(['GameTime', 'Function_mode'] if not d1x else []) +
-			(['LevelSharedRobotInfoState'] if rebirth else [])
+			(['LevelSharedRobotInfoState'] if rebirth else []) +
+			(['FPSLimit'] if chocolate else []) +
+			(['doHomerFrame'] if retro else [])
 			)}),
 			
 		json.dumps(vals)))
